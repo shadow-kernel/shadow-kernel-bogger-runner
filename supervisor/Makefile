@@ -9,6 +9,7 @@ all: bogger_supervisor
 
 bogger_supervisor: $(OBJS) ../core/vmx/bogger_vmx.o ../core/vmx/bogger_cpuid.o \
                    ../core/vmx/bogger_msr.o ../core/vmx/bogger_tsc.o \
+                   ../core/vmx/bogger_ept.o \
                    ../core/passthrough/bogger_acpi.o ../core/passthrough/bogger_iommu.o \
                    ../stealth/bogger_stealth.o ../stealth/bogger_fingerprint.o \
                    ../launcher/bogger_efi_scan.o

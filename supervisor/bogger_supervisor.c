@@ -223,20 +223,26 @@ void bogger_supervisor_main(int argc, char **argv)
     /* 2. Initialise stealth layer */
     bogger_stealth_init();
 
-    /* 3. Initialise IOMMU passthrough */
+    /* 3. Initialise IPC shared memory */
+    bogger_ipc_init();
+
+    /* 4. Initialise ACPI passthrough (find and expose real RSDP) */
+    bogger_acpi_passthrough_init();
+
+    /* 5. Initialise IOMMU passthrough */
     bogger_iommu_init_passthrough();
 
-    /* 4. Enable VMX (CR4.VMXE) */
+    /* 6. Enable VMX (CR4.VMXE) */
     bogger_vmx_enable();
 
-    /* 5. VMXON */
+    /* 7. VMXON */
     if (bogger_vmxon(&s_vmxon_region) != 0) {
         bogger_log(LOG_ERROR, "VMXON failed. Halting.");
         return;
     }
     bogger_log(LOG_INFO, "VMXON succeeded — now in VMX root mode.");
 
-    /* 6. Scan for Windows EFI if not provided */
+    /* 8. Scan for Windows EFI if not provided */
     if (!efi_path || bogger_strlen(efi_path) == 0) {
         bogger_log(LOG_INFO, "Scanning for Windows EFI entry...");
         /* bogger_efi_get_entry() scans block devices for winload.efi */
@@ -248,18 +254,18 @@ void bogger_supervisor_main(int argc, char **argv)
 
     bogger_log(LOG_INFO, "Guest RIP set from EFI entry.");
 
-    /* 7. Setup VMCS */
+    /* 9. Setup VMCS (also initialises EPT and writes EPTP) */
     if (bogger_setup_vmcs(&s_vmcs, guest_rip, guest_rsp) != 0) {
         bogger_log(LOG_ERROR, "VMCS setup failed. Halting.");
         return;
     }
     bogger_log(LOG_INFO, "VMCS configured.");
 
-    /* 8. TSC calibration */
+    /* 10. TSC calibration */
     bogger_tsc_offset_init();
 
-    /* 9. VMLAUNCH — Windows starts here */
-    bogger_log(LOG_INFO, "VMLAUNCH: handing CPU to Windows...");
+    /* 11. VMLAUNCH — Windows starts here */
+    bogger_log(LOG_INFO, "Launching Windows under VMX supervision...");
     if (bogger_vmlaunch() != 0) {
         /* VMLAUNCH failed — read error code from VMCS */
         uint64_t err = bogger_vmread(0x4400); /* VM_INSTRUCTION_ERROR */
@@ -278,5 +284,15 @@ void bogger_supervisor_main(int argc, char **argv)
 int main(int argc, char **argv)
 {
     bogger_supervisor_main(argc, argv);
-    return 0;
+
+    /* Unexpected return — VMLAUNCH should not return on success.
+     * Drop to a rescue shell so the operator can diagnose the failure. */
+    bogger_log(LOG_ERROR, "Unexpected return from supervisor — dropping to /bin/sh");
+
+    static const char *const shell_argv[] = { "/bin/sh", (const char *)0 };
+    extern int execve(const char *, char * const [], char * const []);
+    execve("/bin/sh", (char * const *)shell_argv, (char * const *)0);
+
+    /* execve should not return; if it does, halt */
+    return 1;
 }

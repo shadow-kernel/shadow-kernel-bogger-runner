@@ -1,4 +1,5 @@
 #include "bogger_vmx.h"
+#include "bogger_ept.h"
 
 /* MSR intercept bitmap — 4 KB. Hardware requires 4-KB alignment. */
 uint8_t g_msr_bitmap[4096] __attribute__((aligned(4096)));
@@ -198,6 +199,9 @@ int bogger_setup_vmcs(bogger_vmcs_region_t *vmcs, uint64_t guest_rip,
     sec_ctls |= SEC_PROC_RDTSCP;
     sec_ctls |= SEC_PROC_INVPCID;
     bogger_vmwrite(VMCS_SEC_PROC_BASED_CTLS, sec_ctls);
+
+    /* Initialise EPT and write EPTP into the VMCS */
+    bogger_ept_init();
 
     /* Pin-based controls: minimal */
     bogger_vmwrite(VMCS_PIN_BASED_CTLS, 0);
