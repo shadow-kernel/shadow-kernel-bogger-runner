@@ -95,7 +95,8 @@ static uint64_t *ept_split_1g(int gb_index)
                 ((uint64_t)EPT_MT_WB << 3);
     }
 
-    /* Replace the 1 GB entry with a pointer to the new PD */
+    /* Replace the 1 GB entry with a pointer to the new PD.
+     * Virtual == physical (identity-mapped initramfs environment). */
     uint64_t pd_phys = (uint64_t)(uintptr_t)pd;
     g_ept_pdpt[gb_index] = (pd_phys & EPT_PA_MASK) | EPT_RWX;
 
@@ -127,7 +128,8 @@ static uint64_t *ept_split_2m(uint64_t *pd, int mb2_index)
                 ((uint64_t)EPT_MT_WB << 3);
     }
 
-    /* Replace the 2 MB entry with a pointer to the new PT */
+    /* Replace the 2 MB entry with a pointer to the new PT.
+     * Virtual == physical (identity-mapped initramfs environment). */
     uint64_t pt_phys = (uint64_t)(uintptr_t)pt;
     pd[mb2_index] = (pt_phys & EPT_PA_MASK) | EPT_RWX;
 
@@ -143,16 +145,16 @@ void bogger_ept_init(void)
     /* Build the identity-mapped PDPT (512 × 1 GB large pages) */
     ept_build_identity_pdpt();
 
-    /* PML4[0] → PDPT (covers 0 – 512 GB) */
+    /* PML4[0] → PDPT (covers 0 – 512 GB).
+     * Virtual == physical (identity-mapped initramfs environment). */
     uint64_t pdpt_phys = (uint64_t)(uintptr_t)g_ept_pdpt;
     g_ept_pml4[0] = (pdpt_phys & EPT_PA_MASK) | EPT_RWX;
 
-    /*
-     * Build the EPTP:
-     *   bits 2:0  = memory type for EPT paging structures (WB = 6)
-     *   bits 5:3  = EPT page-walk length minus 1 (4-level = 3)
-     *   bits 11:6 = 0 (AD bits not enabled)
-     *   bits 63:12 = PML4 physical address
+    /* Build EPTP.  Virtual == physical (identity-mapped initramfs environment).
+     * bits 2:0  = memory type for EPT paging structures (WB = 6)
+     * bits 5:3  = EPT page-walk length minus 1 (4-level = 3)
+     * bits 11:6 = 0 (AD bits not enabled)
+     * bits 63:12 = PML4 physical address
      */
     uint64_t pml4_phys = (uint64_t)(uintptr_t)g_ept_pml4;
     uint64_t eptp = (pml4_phys & EPT_PA_MASK) |

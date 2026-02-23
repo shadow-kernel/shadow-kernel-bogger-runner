@@ -278,6 +278,26 @@ void bogger_supervisor_main(int argc, char **argv)
 }
 
 /* ------------------------------------------------------------------ */
+/* Minimal execve() syscall wrapper (no libc in -ffreestanding)       */
+/* ------------------------------------------------------------------ */
+
+static void bogger_execve(const char *path)
+{
+    /* execve(2): syscall 59 on x86-64.
+     * argv = { path, NULL }, envp = NULL (kernel accepts empty envp). */
+    const char *argv[2] = { path, (const char *)0 };
+    __asm__ volatile(
+        "syscall"
+        :
+        : "a"(59L),                     /* __NR_execve */
+          "D"(path),                     /* filename   */
+          "S"(argv),                     /* argv       */
+          "d"((const char *const *)0)    /* envp       */
+        : "rcx", "r11", "memory"
+    );
+}
+
+/* ------------------------------------------------------------------ */
 /* main – C entry point called by the OS                              */
 /* ------------------------------------------------------------------ */
 
@@ -289,9 +309,7 @@ int main(int argc, char **argv)
      * Drop to a rescue shell so the operator can diagnose the failure. */
     bogger_log(LOG_ERROR, "Unexpected return from supervisor — dropping to /bin/sh");
 
-    static const char *const shell_argv[] = { "/bin/sh", (const char *)0 };
-    extern int execve(const char *, char * const [], char * const []);
-    execve("/bin/sh", (char * const *)shell_argv, (char * const *)0);
+    bogger_execve("/bin/sh");
 
     /* execve should not return; if it does, halt */
     return 1;
