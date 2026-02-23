@@ -130,6 +130,8 @@ fail:
  * Rounding up to 310 leaves room for future growth. */
 #define MAX_DEVICE_PATH_LEN 310
 
+#ifdef BOGGER_EFI_STANDALONE
+
 /* GPT EFI System Partition type GUID (mixed-endian as stored on disk):
  * C12A7328-F81F-11D2-BA4B-00A0C93EC93B */
 static const uint8_t gpt_esp_type_guid[16] = {
@@ -305,3 +307,5 @@ int main(void)
     closedir(dir);
     return 1; /* winload.efi not found */
 }
+
+#endif /* BOGGER_EFI_STANDALONE */

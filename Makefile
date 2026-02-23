@@ -1,7 +1,8 @@
 CC      ?= musl-gcc
+ROOT    := $(CURDIR)
 CFLAGS  = -O2 -Wall -Wextra -static -ffreestanding \
-          -I./core/vmx -I./core/passthrough \
-          -I./supervisor -I./stealth -I./launcher
+          -I$(ROOT)/core/vmx -I$(ROOT)/core/passthrough \
+          -I$(ROOT)/supervisor -I$(ROOT)/stealth -I$(ROOT)/launcher
 LDFLAGS = -static
 
 .PHONY: all clean core supervisor stealth launcher
