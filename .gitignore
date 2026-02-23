@@ -1,0 +1,14 @@
+# Build artifacts
+*.o
+*.a
+*.so
+
+# Compiled binaries
+supervisor/bogger_supervisor
+launcher/bogger_efi_scan
+
+# CodeQL
+_codeql_detected_source_root
+
+# Temporary files
+/tmp/
