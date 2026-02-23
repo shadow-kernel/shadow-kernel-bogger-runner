@@ -5,7 +5,7 @@
 extern void bogger_log(int level, const char *fmt, ...);
 
 #ifndef LOG_INFO
-#define LOG_INFO 1
+#define LOG_INFO 3
 #endif
 
 void bogger_cpuid_stealth_configure(void)

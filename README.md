@@ -60,7 +60,7 @@ shadow-kernel-bogger-runner/
 Requirements: `musl-gcc`, GNU `make`
 
 ```sh
-# Build all components (static, ffreestanding)
+# Build all components (static, -ffreestanding)
 ./scripts/build-all.sh
 
 # Install into an initramfs tree

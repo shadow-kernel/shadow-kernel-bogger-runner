@@ -4,9 +4,9 @@
 /* Log levels */
 #define LOG_SILENT  0
 #define LOG_ERROR   1
-#define LOG_INFO    1
-#define LOG_WARN    1
-#define LOG_VERBOSE 2
+#define LOG_WARN    2
+#define LOG_INFO    3
+#define LOG_VERBOSE 4
 
 /*
  * bogger_supervisor_main – Main entry point for the BOGGER hypervisor.

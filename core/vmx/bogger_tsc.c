@@ -55,9 +55,8 @@ void bogger_tsc_offset_init(void)
 {
     uint64_t overhead = bogger_calibrate_vmexit_overhead();
 
-    /* Negate the overhead: guest TSC = host TSC + offset, so a negative
-     * offset removes the accumulated latency observed by the guest. */
-    uint64_t offset = (uint64_t)(-(int64_t)overhead);
+    /* Two's-complement negation: guest TSC = host TSC + offset removes overhead */
+    uint64_t offset = ~overhead + 1ULL;
 
     bogger_vmwrite(VMCS_TSC_OFFSET, offset);
 }

@@ -63,7 +63,7 @@ static int bogger_strlen(const char *s)
 /* bogger_log                                                          */
 /* ------------------------------------------------------------------ */
 
-static int g_log_level = LOG_INFO;
+static int g_log_level = LOG_INFO; /* 3 = INFO and below (ERROR, WARN, INFO) */
 
 void bogger_log(int level, const char *fmt, ...)
 {
@@ -263,8 +263,7 @@ void bogger_supervisor_main(int argc, char **argv)
     if (bogger_vmlaunch() != 0) {
         /* VMLAUNCH failed — read error code from VMCS */
         uint64_t err = bogger_vmread(0x4400); /* VM_INSTRUCTION_ERROR */
-        bogger_log(LOG_ERROR, "VMLAUNCH failed, error=");
-        (void)err;
+        bogger_log(LOG_ERROR, "VMLAUNCH failed, VM instruction error=%x", (unsigned)err);
         return;
     }
 

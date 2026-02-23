@@ -126,6 +126,10 @@ fail:
 #define ESP_MOUNT_POINT "/tmp/bogger_esp"
 #define WINLOAD_REL_PATH "EFI/Microsoft/Boot/winload.efi"
 
+/* Maximum device path length: "/dev/" (5) + NAME_MAX (255) + "p" + "128" + NUL = 265.
+ * Rounding up to 310 leaves room for future growth. */
+#define MAX_DEVICE_PATH_LEN 310
+
 /* GPT EFI System Partition type GUID (mixed-endian as stored on disk):
  * C12A7328-F81F-11D2-BA4B-00A0C93EC93B */
 static const uint8_t gpt_esp_type_guid[16] = {
@@ -243,7 +247,7 @@ static int scan_gpt_device(const char *disk_dev, char *out_path, size_t out_len)
 
         if (guid_eq(entry.type_guid, gpt_esp_type_guid)) {
             /* Construct partition device name: disk_dev + partition number */
-            char part_dev[310];
+            char part_dev[MAX_DEVICE_PATH_LEN];
             /* Heuristic: /dev/sdaX or /dev/nvme0n1pX */
             const char *base = strrchr(disk_dev, '/');
             base = base ? base + 1 : disk_dev;
@@ -281,7 +285,7 @@ int main(void)
     }
 
     while ((ent = readdir(dir)) != NULL) {
-        char disk_dev[300];
+        char disk_dev[MAX_DEVICE_PATH_LEN];
 
         /* Skip . and .. and loop/ram devices */
         if (ent->d_name[0] == '.')                    continue;

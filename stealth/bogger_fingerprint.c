@@ -6,10 +6,10 @@
 extern void bogger_log(int level, const char *fmt, ...);
 
 #ifndef LOG_INFO
-#define LOG_INFO 1
+#define LOG_INFO 3
 #endif
 #ifndef LOG_WARN
-#define LOG_WARN 1
+#define LOG_WARN 2
 #endif
 
 /* ------------------------------------------------------------------ */
@@ -196,10 +196,8 @@ void bogger_fingerprint_verify(void)
 {
     bogger_fingerprint_read();
 
-    bogger_log(LOG_INFO, "Fingerprint: Vendor  = ");
-    bogger_log(LOG_INFO, g_vendor[0]  ? g_vendor  : "(unknown)");
-    bogger_log(LOG_INFO, "Fingerprint: Product = ");
-    bogger_log(LOG_INFO, g_product[0] ? g_product : "(unknown)");
+    bogger_log(LOG_INFO, "Fingerprint: Vendor  = %s", g_vendor[0]  ? g_vendor  : "(unknown)");
+    bogger_log(LOG_INFO, "Fingerprint: Product = %s", g_product[0] ? g_product : "(unknown)");
 
     /* Scan both strings for virtualisation signatures */
     int i;
