@@ -124,7 +124,7 @@ fail:
 /* ------------------------------------------------------------------ */
 
 #define ESP_MOUNT_POINT "/tmp/bogger_esp"
-#define WINLOAD_REL_PATH "EFI/Microsoft/Boot/winload.efi"
+#define BOOTMGFW_REL_PATH "EFI/Microsoft/Boot/bootmgfw.efi"
 
 /* Maximum device path length: "/dev/" (5) + NAME_MAX (255) + "p" + "128" + NUL = 265.
  * Rounding up to 310 leaves room for future growth. */
@@ -196,7 +196,7 @@ static int try_mount_and_find(const char *dev, char *out_path, size_t out_len)
         return 0;
 
     snprintf(winload_path, sizeof(winload_path),
-             "%s/%s", ESP_MOUNT_POINT, WINLOAD_REL_PATH);
+             "%s/%s", ESP_MOUNT_POINT, BOOTMGFW_REL_PATH);
 
     if (stat(winload_path, &st) == 0 && S_ISREG(st.st_mode)) {
         snprintf(out_path, out_len, "%s", winload_path);

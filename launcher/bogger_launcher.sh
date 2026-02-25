@@ -30,7 +30,8 @@ if [ -z "${BOGGER_EFI_PATH:-}" ]; then
     bogger_log 1 "Scanning for Windows EFI partition..."
     BOGGER_EFI_PATH=$("$BOGGER_DIR/launcher/bogger_efi_scan" 2>/dev/null || true)
     if [ -z "$BOGGER_EFI_PATH" ]; then
-        bogger_log 1 "FATAL: winload.efi not found. Check disk configuration."
+        bogger_log 1 "FATAL: bootmgfw.efi not found on any EFI System Partition."
+        bogger_log 1 "Check that Windows is installed and disk is attached."
         exit 1
     fi
 fi
