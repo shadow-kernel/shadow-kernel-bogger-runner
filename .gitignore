@@ -3,6 +3,15 @@
 *.a
 *.so
 
+# Kernel module build artifacts
+*.ko
+*.mod
+*.mod.c
+*.order
+*.symvers
+.*.cmd
+.tmp_versions/
+
 # Compiled binaries
 supervisor/bogger_supervisor
 launcher/bogger_efi_scan
