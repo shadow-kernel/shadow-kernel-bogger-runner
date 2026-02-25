@@ -38,8 +38,9 @@ fi
 
 bogger_log 1 "Windows EFI target: $BOGGER_EFI_PATH"
 
-# Step 3: Launch BOGGER supervisor (takes over CPU, boots Windows)
+# Step 3: Load BOGGER kernel module (takes over CPU from Ring 0, boots Windows)
 bogger_log 1 "Initializing hypervisor and launching Windows..."
-exec "$BOGGER_DIR/supervisor/bogger_supervisor" \
-    --efi  "$BOGGER_EFI_PATH" \
-    --conf "$CONF"
+insmod "$BOGGER_DIR/kmod/bogger_kmod.ko" bogger_efi="$BOGGER_EFI_PATH" || {
+    bogger_log 1 "FATAL: Failed to load bogger_kmod.ko (check dmesg for details)."
+    exit 1
+}
