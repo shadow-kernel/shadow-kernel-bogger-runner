@@ -9,6 +9,7 @@
 #include <asm/cpufeature.h>
 #include <asm/io.h>
 #include <asm/svm.h>
+#include <asm/page.h>
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("BOGGER");
@@ -97,7 +98,7 @@ static int bogger_svm_hsave_setup(void)
 {
     u64 phys;
 
-    hsave_area = kzalloc(PAGE_SIZE, GFP_KERNEL);
+    hsave_area = (void *)__get_free_page(GFP_KERNEL | __GFP_ZERO);
     if (!hsave_area)
         return -ENOMEM;
 
@@ -109,19 +110,17 @@ static int bogger_svm_hsave_setup(void)
 
 static int bogger_vmcb_init(void)
 {
-    u64 efer;
-
-    g_vmcb = kzalloc(PAGE_SIZE, GFP_KERNEL);
+    g_vmcb = (struct vmcb *)__get_free_page(GFP_KERNEL | __GFP_ZERO);
     if (!g_vmcb)
         return -ENOMEM;
 
-    /* Intercept HLT, IOIO, VMRUN and CPUID instructions */
+    /* Intercept HLT, IOIO and CPUID instructions — NOT INTERCEPT_VMRUN */
+    /* Setting INTERCEPT_VMRUN under KVM Nested SVM would intercept our own
+     * VMRUN before it reaches the guest, causing an immediate Triple Fault. */
     g_vmcb->control.intercepts[INTERCEPT_HLT / 32]       |=
         (1U << (INTERCEPT_HLT % 32));
     g_vmcb->control.intercepts[INTERCEPT_IOIO_PROT / 32] |=
         (1U << (INTERCEPT_IOIO_PROT % 32));
-    g_vmcb->control.intercepts[INTERCEPT_VMRUN / 32]     |=
-        (1U << (INTERCEPT_VMRUN % 32));
     g_vmcb->control.intercepts[INTERCEPT_CPUID / 32]     |=
         (1U << (INTERCEPT_CPUID % 32));
 
@@ -166,9 +165,13 @@ static int bogger_vmcb_init(void)
     g_vmcb->save.dr7    = 0x400;
     g_vmcb->save.dr6    = 0xFFFF0FF0;
 
-    /* EFER in the VMCB save area must have SVME set */
-    efer = native_read_msr(MSR_EFER);
-    g_vmcb->save.efer = efer | EFER_SVME;
+    /*
+     * CRITICAL: Guest EFER must only have SVME=1.
+     * The guest starts in Real Mode (CR0=0x10, PG=0).  Copying the host
+     * EFER (which has LMA=1) would produce an inconsistent state that
+     * KVM's Nested SVM validator rejects, causing an immediate Triple Fault.
+     */
+    g_vmcb->save.efer = EFER_SVME;
 
     pr_info("[BOGGER] VMCB ready CR0=0x%llx EFER=0x%llx RIP=0x%llx\n",
             g_vmcb->save.cr0, g_vmcb->save.efer, g_vmcb->save.rip);
@@ -316,7 +319,7 @@ static int __init bogger_kmod_init(void)
 err_free_npt:
     bogger_npt_free();
 err_free_hsave:
-    kfree(hsave_area);
+    free_page((unsigned long)hsave_area);
     hsave_area = NULL;
 err_disable_svm:
     {
@@ -332,12 +335,12 @@ static void __exit bogger_kmod_exit(void)
 {
     pr_info("[BOGGER] Kernel module unloaded\n");
 
-    kfree(g_vmcb);
+    free_page((unsigned long)g_vmcb);
     g_vmcb = NULL;
 
     bogger_npt_free();
 
-    kfree(hsave_area);
+    free_page((unsigned long)hsave_area);
     hsave_area = NULL;
 
     if (svm_enabled) {
