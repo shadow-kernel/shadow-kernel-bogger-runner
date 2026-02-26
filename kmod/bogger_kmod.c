@@ -2,6 +2,7 @@
 #include <linux/kernel.h>
 #include <linux/init.h>
 #include <linux/slab.h>
+#include <linux/gfp.h>
 #include <asm/processor.h>
 #include <asm/msr.h>
 #include <asm/msr-index.h>
@@ -29,6 +30,50 @@ static struct vmcb *g_vmcb;
 /* SVM_EXIT_INVALID is not exported in uapi headers; define it here */
 #define BOGGER_SVM_EXIT_INVALID  0xffffffffU
 
+/* Nested Page Table (NPT) top-level PML4 and PDPT pages */
+static u64 *npt_pml4;
+static u64 *npt_pdpt;
+
+/* Allocate a minimal 4-level NPT identity map covering the first 4 GB
+ * using four 1 GB huge-page PDPT entries.
+ */
+static int bogger_npt_init(void)
+{
+    npt_pml4 = (u64 *)get_zeroed_page(GFP_KERNEL);
+    if (!npt_pml4)
+        return -ENOMEM;
+
+    npt_pdpt = (u64 *)get_zeroed_page(GFP_KERNEL);
+    if (!npt_pdpt) {
+        free_page((unsigned long)npt_pml4);
+        npt_pml4 = NULL;
+        return -ENOMEM;
+    }
+
+    /* Four 1 GB identity-map entries: P+RW+US+PS */
+    npt_pdpt[0] = 0x000000000ULL | 0x87ULL;
+    npt_pdpt[1] = 0x040000000ULL | 0x87ULL;
+    npt_pdpt[2] = 0x080000000ULL | 0x87ULL;
+    npt_pdpt[3] = 0x0C0000000ULL | 0x87ULL;
+
+    /* PML4[0] -> PDPT: P+RW+US */
+    npt_pml4[0] = virt_to_phys(npt_pdpt) | 0x07ULL;
+
+    return 0;
+}
+
+static void bogger_npt_free(void)
+{
+    if (npt_pdpt) {
+        free_page((unsigned long)npt_pdpt);
+        npt_pdpt = NULL;
+    }
+    if (npt_pml4) {
+        free_page((unsigned long)npt_pml4);
+        npt_pml4 = NULL;
+    }
+}
+
 static int bogger_svm_check_support(void)
 {
     /* CPUID Fn8000_000A: SVM feature bits */
@@ -43,7 +88,7 @@ static int bogger_svm_enable(void)
 {
     u64 efer = native_read_msr(MSR_EFER);
     efer |= EFER_SVME;
-    native_write_msr(MSR_EFER, (u32)efer, (u32)(efer >> 32));
+    native_write_msr(MSR_EFER, efer);
     pr_info("[BOGGER] EFER.SVME set — SVM enabled\n");
     return 0;
 }
@@ -57,7 +102,7 @@ static int bogger_svm_hsave_setup(void)
         return -ENOMEM;
 
     phys = virt_to_phys(hsave_area);
-    native_write_msr(MSR_VM_HSAVE_PA, (u32)phys, (u32)(phys >> 32));
+    native_write_msr(MSR_VM_HSAVE_PA, phys);
     pr_info("[BOGGER] VM_HSAVE_PA set to 0x%llx\n", phys);
     return 0;
 }
@@ -70,13 +115,15 @@ static int bogger_vmcb_init(void)
     if (!g_vmcb)
         return -ENOMEM;
 
-    /* Intercept HLT, IOIO and VMRUN instructions */
+    /* Intercept HLT, IOIO, VMRUN and CPUID instructions */
     g_vmcb->control.intercepts[INTERCEPT_HLT / 32]       |=
         (1U << (INTERCEPT_HLT % 32));
     g_vmcb->control.intercepts[INTERCEPT_IOIO_PROT / 32] |=
         (1U << (INTERCEPT_IOIO_PROT % 32));
     g_vmcb->control.intercepts[INTERCEPT_VMRUN / 32]     |=
         (1U << (INTERCEPT_VMRUN % 32));
+    g_vmcb->control.intercepts[INTERCEPT_CPUID / 32]     |=
+        (1U << (INTERCEPT_CPUID % 32));
 
     /* Guest ASID must be non-zero; 1 is the first valid ASID */
     g_vmcb->control.asid = 1;
@@ -125,6 +172,12 @@ static int bogger_vmcb_init(void)
 
     pr_info("[BOGGER] VMCB ready CR0=0x%llx EFER=0x%llx RIP=0x%llx\n",
             g_vmcb->save.cr0, g_vmcb->save.efer, g_vmcb->save.rip);
+
+    /* Activate Nested Paging (NPT/RVI) */
+    g_vmcb->control.nested_ctl = 1ULL;
+    g_vmcb->control.nested_cr3 = virt_to_phys(npt_pml4);
+    pr_info("[BOGGER] NPT enabled nCR3=0x%llx\n", g_vmcb->control.nested_cr3);
+
     return 0;
 }
 
@@ -137,7 +190,7 @@ static void bogger_vmrun_loop(void)
     pr_info("[BOGGER] Attempting VMRUN\n");
     pr_info("[BOGGER] Entering VMRUN loop\n");
 
-    while (exits < 16) {
+    while (true) {
         __asm__ volatile(
             "vmload %[pa]\n\t"
             "vmrun  %[pa]\n\t"
@@ -152,7 +205,7 @@ static void bogger_vmrun_loop(void)
 
         switch (exit_code) {
         case BOGGER_SVM_EXIT_INVALID:
-            pr_err("[BOGGER] Unhandled exit=0x%x RIP=0x%llx\n",
+            pr_err("[BOGGER] VMRUN exit=0x%x (INVALID) RIP=0x%llx\n",
                    exit_code, g_vmcb->save.rip);
             goto done;
 
@@ -162,8 +215,10 @@ static void bogger_vmrun_loop(void)
             goto done;
 
         case SVM_EXIT_IOIO:
-            pr_info("[BOGGER] VMRUN exit=0x%x (IOIO) RIP=0x%llx\n",
-                    exit_code, g_vmcb->save.rip);
+            pr_debug("[BOGGER] IOIO port=0x%llx RIP=0x%llx -> 0x%llx\n",
+                     (g_vmcb->control.exit_info_1 >> 16) & 0xFFFFULL,
+                     g_vmcb->save.rip,
+                     g_vmcb->control.exit_info_2);
             /* Advance RIP using exit_info_2 (next sequential instruction) */
             g_vmcb->save.rip = g_vmcb->control.exit_info_2;
             break;
@@ -173,15 +228,40 @@ static void bogger_vmrun_loop(void)
                     exit_code, g_vmcb->save.rip);
             goto done;
 
+        case SVM_EXIT_SHUTDOWN:
+            pr_info("[BOGGER] VMRUN exit=0x%x (SHUTDOWN) RIP=0x%llx\n",
+                    exit_code, g_vmcb->save.rip);
+            goto done;
+
         case SVM_EXIT_NPF:
             pr_info("[BOGGER] VMRUN exit=0x%x (NPF) RIP=0x%llx\n",
                     exit_code, g_vmcb->save.rip);
             goto done;
 
+        case SVM_EXIT_CPUID: {
+            u32 eax = (u32)g_vmcb->save.rax;
+            u32 ebx = 0, ecx = (u32)g_vmcb->save.rcx, edx = 0;
+
+            native_cpuid(&eax, &ebx, &ecx, &edx);
+            g_vmcb->save.rax = eax;
+            g_vmcb->save.rbx = ebx;
+            g_vmcb->save.rcx = ecx;
+            g_vmcb->save.rdx = edx;
+            g_vmcb->save.rip += 2;  /* CPUID is 2 bytes: 0F A2 */
+            break;
+        }
+
         default:
-            pr_err("[BOGGER] Unhandled exit=0x%x RIP=0x%llx\n",
-                   exit_code, g_vmcb->save.rip);
-            goto done;
+            pr_warn("[BOGGER] Unhandled exit=0x%x RIP=0x%llx\n",
+                    exit_code, g_vmcb->save.rip);
+            /* Advance RIP via exit_info_2 if it holds a valid next RIP,
+             * otherwise stop to avoid jumping to an invalid address. */
+            if (g_vmcb->control.exit_info_2 != 0 &&
+                g_vmcb->control.exit_info_2 > g_vmcb->save.rip)
+                g_vmcb->save.rip = g_vmcb->control.exit_info_2;
+            else
+                goto done;
+            break;
         }
     }
 
@@ -214,18 +294,27 @@ static int __init bogger_kmod_init(void)
         goto err_disable_svm;
     }
 
-    /* 4. Allocate and initialise VMCB */
-    ret = bogger_vmcb_init();
+    /* 4. Allocate Nested Page Tables */
+    ret = bogger_npt_init();
     if (ret) {
-        pr_err("[BOGGER] VMCB init failed (%d)\n", ret);
+        pr_err("[BOGGER] NPT init failed (%d)\n", ret);
         goto err_free_hsave;
     }
 
-    /* 5. VMRUN loop */
+    /* 5. Allocate and initialise VMCB */
+    ret = bogger_vmcb_init();
+    if (ret) {
+        pr_err("[BOGGER] VMCB init failed (%d)\n", ret);
+        goto err_free_npt;
+    }
+
+    /* 6. VMRUN loop */
     bogger_vmrun_loop();
 
     return 0;
 
+err_free_npt:
+    bogger_npt_free();
 err_free_hsave:
     kfree(hsave_area);
     hsave_area = NULL;
@@ -233,7 +322,7 @@ err_disable_svm:
     {
         u64 efer = native_read_msr(MSR_EFER);
         efer &= ~EFER_SVME;
-        native_write_msr(MSR_EFER, (u32)efer, (u32)(efer >> 32));
+        native_write_msr(MSR_EFER, efer);
         svm_enabled = false;
     }
     return ret;
@@ -246,6 +335,8 @@ static void __exit bogger_kmod_exit(void)
     kfree(g_vmcb);
     g_vmcb = NULL;
 
+    bogger_npt_free();
+
     kfree(hsave_area);
     hsave_area = NULL;
 
@@ -253,7 +344,7 @@ static void __exit bogger_kmod_exit(void)
         /* Clear EFER.SVME to restore pre-module state */
         u64 efer = native_read_msr(MSR_EFER);
         efer &= ~EFER_SVME;
-        native_write_msr(MSR_EFER, (u32)efer, (u32)(efer >> 32));
+        native_write_msr(MSR_EFER, efer);
         svm_enabled = false;
     }
 }
