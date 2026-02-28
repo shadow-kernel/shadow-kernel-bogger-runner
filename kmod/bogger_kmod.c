@@ -1559,11 +1559,11 @@ static int bogger_vmcb_init(void)
     g_vmcb->control.intercepts[INTERCEPT_VMRUN / 32] |=
         (1U << (INTERCEPT_VMRUN % 32));
 
-    /* INTERCEPT_INTR: cause a VMEXIT on physical interrupts so the host
-     * scheduler can run (cond_resched) and timer-based OVMF delays make
-     * progress.  Without this the VMRUN loop never yields. */
-    g_vmcb->control.intercepts[INTERCEPT_INTR / 32] |=
-        (1U << (INTERCEPT_INTR % 32));
+    /* NOTE: INTERCEPT_INTR is intentionally NOT set here.
+     * Under nested KVM/SVM it causes kernel panic (stack guard page hit)
+     * because the host interrupt handler fires in wrong stack context
+     * after VMEXIT.  Use "nosoftlockup watchdog_thresh=0" kernel params
+     * instead to prevent the watchdog from killing the VMRUN thread. */
 
     g_vmcb->control.intercepts[INTERCEPT_HLT / 32]       |=
         (1U << (INTERCEPT_HLT % 32));
