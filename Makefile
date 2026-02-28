@@ -5,7 +5,7 @@ CFLAGS  = -O2 -Wall -Wextra -static -ffreestanding \
           -I$(ROOT)/supervisor -I$(ROOT)/stealth -I$(ROOT)/launcher
 LDFLAGS = -static
 
-KDIR    ?= /lib/modules/$(shell uname -r)/build
+KDIR    ?= $(ROOT)/../linux
 
 .PHONY: all clean core supervisor stealth launcher kmod
 

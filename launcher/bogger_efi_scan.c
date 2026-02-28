@@ -1,9 +1,18 @@
 /*
- * bogger_efi_scan.c – Scan block devices for the Windows EFI System Partition
- * and locate winload.efi.
+ * bogger_efi_scan.c – Scan ALL block devices for the Windows EFI System
+ * Partition and locate bootmgfw.efi.
  *
  * When built as a standalone binary (main() defined below) it prints the full
- * path to winload.efi on stdout and exits 0, or prints nothing and exits 1.
+ * path to bootmgfw.efi on stdout and exits 0, or prints nothing and exits 1.
+ *
+ * The scan covers:
+ *  1. All whole-disk block devices in /sys/block (sda, nvme0n1, mmcblk0, …)
+ *     – their GPT partition tables are parsed to find EFI System Partitions.
+ *  2. As a fallback: every partition listed in /proc/partitions is tried as a
+ *     plain vfat mount + file-existence check.
+ *
+ * FAT32 case-insensitivity is handled by mounting with 'shortname=mixed' and
+ * by trying multiple case variants of the bootmgfw.efi path.
  *
  * When included as part of the supervisor build, bogger_efi_get_entry() parses
  * the PE/COFF header of the EFI binary and returns its entry-point RVA as an
@@ -177,39 +186,138 @@ static int guid_eq(const uint8_t *a, const uint8_t *b)
 }
 
 /*
+ * get_logical_sector_size – Read the logical block size of a disk from sysfs.
+ * Falls back to 512 if the file cannot be read.
+ */
+static unsigned int get_logical_sector_size(const char *disk_dev)
+{
+    /* disk_dev is e.g. "/dev/sda"; extract "sda" */
+    const char *name = strrchr(disk_dev, '/');
+    name = name ? name + 1 : disk_dev;
+
+    char path[512];
+    snprintf(path, sizeof(path),
+             "/sys/block/%s/queue/logical_block_size", name);
+
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return 512;
+
+    unsigned int sz = 512;
+    if (fscanf(f, "%u", &sz) != 1 || sz == 0)
+        sz = 512;
+    fclose(f);
+    return sz;
+}
+
+/*
+ * case_insensitive_file_exists – Check if bootmgfw.efi exists on the mounted
+ * ESP, trying multiple common case variants of the path.
+ *
+ * On Linux, vfat mounts can be case-sensitive depending on mount options.
+ * We try several known variants to be safe.
+ */
+static int case_insensitive_file_exists(const char *mount_point,
+                                         char *out_path, size_t out_len)
+{
+    static const char *variants[] = {
+        "EFI/Microsoft/Boot/bootmgfw.efi",
+        "efi/Microsoft/Boot/bootmgfw.efi",
+        "EFI/microsoft/boot/bootmgfw.efi",
+        "efi/microsoft/boot/bootmgfw.efi",
+        "EFI/Microsoft/Boot/BOOTMGFW.EFI",
+        "EFI/Microsoft/Boot/Bootmgfw.efi",
+        "EFI/MICROSOFT/BOOT/BOOTMGFW.EFI",
+        "efi/MICROSOFT/BOOT/BOOTMGFW.EFI",
+        NULL
+    };
+
+    struct stat st;
+    char try_path[512];
+    int i;
+
+    for (i = 0; variants[i] != NULL; i++) {
+        snprintf(try_path, sizeof(try_path), "%s/%s", mount_point, variants[i]);
+        if (stat(try_path, &st) == 0 && S_ISREG(st.st_mode)) {
+            snprintf(out_path, out_len, "%s", try_path);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/*
  * try_mount_and_find – Try to mount a partition device as vfat and check
- * whether winload.efi exists on it.
+ * whether bootmgfw.efi exists on it.  Tries multiple mount option combos
+ * and multiple case variants of the file path.
  *
  * Returns 1 and fills out_path (up to out_len bytes) on success, 0 otherwise.
  */
 static int try_mount_and_find(const char *dev, char *out_path, size_t out_len)
 {
     struct stat st;
-    char winload_path[512];
     int  found = 0;
 
     /* Create mount point */
     if (stat(ESP_MOUNT_POINT, &st) != 0)
         mkdir(ESP_MOUNT_POINT, 0700);
 
-    if (mount(dev, ESP_MOUNT_POINT, "vfat", MS_RDONLY, "") != 0)
-        return 0;
+    /* Try mounting with different options for case handling */
+    static const char *mount_opts[] = {
+        "shortname=mixed",      /* preserves case, matches case-insensitive */
+        "shortname=winnt",      /* Windows NT style */
+        "",                     /* kernel defaults */
+        NULL
+    };
 
-    snprintf(winload_path, sizeof(winload_path),
-             "%s/%s", ESP_MOUNT_POINT, BOOTMGFW_REL_PATH);
-
-    if (stat(winload_path, &st) == 0 && S_ISREG(st.st_mode)) {
-        snprintf(out_path, out_len, "%s", winload_path);
-        found = 1;
+    int mounted = 0;
+    int opt_idx;
+    for (opt_idx = 0; mount_opts[opt_idx] != NULL; opt_idx++) {
+        if (mount(dev, ESP_MOUNT_POINT, "vfat", MS_RDONLY,
+                  mount_opts[opt_idx]) == 0) {
+            mounted = 1;
+            break;
+        }
     }
 
-    umount(ESP_MOUNT_POINT);
+    if (!mounted)
+        return 0;
+
+    found = case_insensitive_file_exists(ESP_MOUNT_POINT, out_path, out_len);
+
+    if (!found) {
+        /* Only unmount if bootmgfw.efi was NOT found.
+         * When found, leave the ESP mounted so the kernel module
+         * can read the EFI binary via kernel_read_file_from_path(). */
+        umount(ESP_MOUNT_POINT);
+    } else {
+        fprintf(stderr, "[bogger_efi_scan] ESP left mounted at %s for kmod access\n",
+                ESP_MOUNT_POINT);
+    }
     return found;
+}
+
+/*
+ * needs_partition_separator – Returns 1 if the device name scheme requires
+ * a 'p' between the disk name and partition number (e.g. nvme0n1p1).
+ */
+static int needs_partition_separator(const char *base)
+{
+    if (strncmp(base, "nvme", 4) == 0)    return 1;
+    if (strncmp(base, "mmcblk", 6) == 0)  return 1;
+    if (strncmp(base, "loop", 4) == 0)    return 1;
+    if (strncmp(base, "nbd", 3) == 0)     return 1;
+    if (strncmp(base, "md", 2) == 0)      return 1;
+    if (strncmp(base, "xvd", 3) == 0 &&
+        base[3] >= '0' && base[3] <= '9') return 1;
+    return 0;
 }
 
 /*
  * scan_gpt_device – Parse the GPT partition table of 'disk_dev' and try each
  * EFI System Partition entry.
+ *
+ * Reads the logical sector size from sysfs to correctly handle 4Kn disks.
  *
  * Returns 1 and fills out_path on success, 0 otherwise.
  */
@@ -223,8 +331,10 @@ static int scan_gpt_device(const char *disk_dev, char *out_path, size_t out_len)
     if (fd < 0)
         return 0;
 
-    /* LBA 1 = GPT header (512-byte sectors assumed) */
-    if (lseek(fd, 512, SEEK_SET) < 0) { close(fd); return 0; }
+    unsigned int sector_size = get_logical_sector_size(disk_dev);
+
+    /* LBA 1 = GPT header */
+    if (lseek(fd, (off_t)sector_size, SEEK_SET) < 0) { close(fd); return 0; }
     if (read(fd, &hdr, sizeof(hdr)) != (ssize_t)sizeof(hdr)) {
         close(fd); return 0;
     }
@@ -234,7 +344,10 @@ static int scan_gpt_device(const char *disk_dev, char *out_path, size_t out_len)
         close(fd); return 0;
     }
 
-    off_t part_off = (off_t)(hdr.part_entry_lba * 512);
+    fprintf(stderr, "[bogger_efi_scan] %s: valid GPT found (sector_size=%u, %u partitions)\n",
+            disk_dev, sector_size, hdr.num_part_entries);
+
+    off_t part_off = (off_t)(hdr.part_entry_lba * sector_size);
     if (lseek(fd, part_off, SEEK_SET) < 0) { close(fd); return 0; }
 
     for (i = 0; i < hdr.num_part_entries && i < 128; i++) {
@@ -248,16 +361,18 @@ static int scan_gpt_device(const char *disk_dev, char *out_path, size_t out_len)
             continue;
 
         if (guid_eq(entry.type_guid, gpt_esp_type_guid)) {
-            /* Construct partition device name: disk_dev + partition number */
+            /* Construct partition device name */
             char part_dev[MAX_DEVICE_PATH_LEN];
-            /* Heuristic: /dev/sdaX or /dev/nvme0n1pX */
             const char *base = strrchr(disk_dev, '/');
             base = base ? base + 1 : disk_dev;
 
-            if (strncmp(base, "nvme", 4) == 0 || strncmp(base, "mmcblk", 6) == 0)
+            if (needs_partition_separator(base))
                 snprintf(part_dev, sizeof(part_dev), "%sp%u", disk_dev, i + 1);
             else
                 snprintf(part_dev, sizeof(part_dev), "%s%u", disk_dev, i + 1);
+
+            fprintf(stderr, "[bogger_efi_scan] Trying ESP: %s (GPT entry %u on %s)\n",
+                    part_dev, i + 1, disk_dev);
 
             if (try_mount_and_find(part_dev, out_path, out_len)) {
                 close(fd);
@@ -267,6 +382,59 @@ static int scan_gpt_device(const char *disk_dev, char *out_path, size_t out_len)
     }
 
     close(fd);
+    return 0;
+}
+
+/*
+ * scan_proc_partitions_fallback – If GPT scanning of whole disks did not
+ * find bootmgfw.efi, iterate over every partition in /proc/partitions
+ * and try a brute-force mount + check.  This catches edge cases where
+ * the GPT header is unreadable but the partition is still valid
+ * (e.g. hybrid MBR, or device-mapper partitions).
+ */
+static int scan_proc_partitions_fallback(char *out_path, size_t out_len)
+{
+    FILE *fp = fopen("/proc/partitions", "r");
+    if (!fp)
+        return 0;
+
+    char line[256];
+    while (fgets(line, sizeof(line), fp)) {
+        unsigned int major_num, minor_num;
+        unsigned long long blocks;
+        char name[128];
+
+        if (sscanf(line, " %u %u %llu %127s",
+                   &major_num, &minor_num, &blocks, name) != 4)
+            continue;
+
+        /* Skip whole disks (minor 0) and virtual devices */
+        if (minor_num == 0)
+            continue;
+        if (strncmp(name, "loop", 4) == 0)
+            continue;
+        if (strncmp(name, "ram", 3) == 0)
+            continue;
+        if (strncmp(name, "zram", 4) == 0)
+            continue;
+
+        /* Skip very large partitions (> 1 GB) – EFI SP is usually ≤ 512 MB */
+        if (blocks > 1048576ULL)
+            continue;
+
+        char dev_path[MAX_DEVICE_PATH_LEN];
+        snprintf(dev_path, sizeof(dev_path), "/dev/%s", name);
+
+        fprintf(stderr, "[bogger_efi_scan] Fallback: trying %s (%llu KB)\n",
+                dev_path, blocks);
+
+        if (try_mount_and_find(dev_path, out_path, out_len)) {
+            fclose(fp);
+            return 1;
+        }
+    }
+
+    fclose(fp);
     return 0;
 }
 
@@ -280,32 +448,51 @@ int main(void)
     struct dirent *ent;
     char           out_path[512] = {0};
 
+    fprintf(stderr, "[bogger_efi_scan] Starting EFI partition scan on ALL disks...\n");
+
+    /* ── Phase 1: Scan all whole-disk block devices via /sys/block ── */
     dir = opendir("/sys/block");
     if (!dir) {
         fprintf(stderr, "[bogger_efi_scan] Cannot open /sys/block\n");
-        return 1;
-    }
+    } else {
+        while ((ent = readdir(dir)) != NULL) {
+            char disk_dev[MAX_DEVICE_PATH_LEN];
 
-    while ((ent = readdir(dir)) != NULL) {
-        char disk_dev[MAX_DEVICE_PATH_LEN];
+            /* Skip . and .. and virtual devices */
+            if (ent->d_name[0] == '.')                    continue;
+            if (strncmp(ent->d_name, "loop", 4) == 0)    continue;
+            if (strncmp(ent->d_name, "ram",  3) == 0)    continue;
+            if (strncmp(ent->d_name, "zram", 4) == 0)    continue;
+            if (strncmp(ent->d_name, "dm-",  3) == 0)    continue;
+            if (strncmp(ent->d_name, "sr",   2) == 0)    continue;
+            if (strncmp(ent->d_name, "fd",   2) == 0)    continue;
 
-        /* Skip . and .. and loop/ram devices */
-        if (ent->d_name[0] == '.')                    continue;
-        if (strncmp(ent->d_name, "loop", 4) == 0)    continue;
-        if (strncmp(ent->d_name, "ram",  3) == 0)    continue;
-        if (strncmp(ent->d_name, "zram", 4) == 0)    continue;
+            snprintf(disk_dev, sizeof(disk_dev), "/dev/%s", ent->d_name);
 
-        snprintf(disk_dev, sizeof(disk_dev), "/dev/%s", ent->d_name);
+            fprintf(stderr, "[bogger_efi_scan] Scanning disk: %s\n", disk_dev);
 
-        if (scan_gpt_device(disk_dev, out_path, sizeof(out_path))) {
-            closedir(dir);
-            puts(out_path);
-            return 0;
+            if (scan_gpt_device(disk_dev, out_path, sizeof(out_path))) {
+                closedir(dir);
+                fprintf(stderr, "[bogger_efi_scan] FOUND: %s\n", out_path);
+                puts(out_path);
+                return 0;
+            }
         }
+        closedir(dir);
     }
 
-    closedir(dir);
-    return 1; /* winload.efi not found */
+    /* ── Phase 2: Fallback – brute-force try every partition ── */
+    fprintf(stderr, "[bogger_efi_scan] GPT scan did not find bootmgfw.efi, "
+                    "trying /proc/partitions fallback...\n");
+
+    if (scan_proc_partitions_fallback(out_path, sizeof(out_path))) {
+        fprintf(stderr, "[bogger_efi_scan] FOUND (fallback): %s\n", out_path);
+        puts(out_path);
+        return 0;
+    }
+
+    fprintf(stderr, "[bogger_efi_scan] bootmgfw.efi NOT FOUND on any partition.\n");
+    return 1; /* bootmgfw.efi not found */
 }
 
 #endif /* BOGGER_EFI_STANDALONE */

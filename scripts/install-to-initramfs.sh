@@ -6,7 +6,7 @@ INSTALL_BASE="$INITRAMFS_DIR/opt/bogger"
 
 echo "[BOGGER] Installing to: $INSTALL_BASE"
 
-mkdir -p "$INSTALL_BASE"/{supervisor,launcher,stealth,scripts}
+mkdir -p "$INSTALL_BASE"/{supervisor,launcher,stealth,scripts,kmod}
 
 # Binaries
 [ -f supervisor/bogger_supervisor ] && \
@@ -16,6 +16,14 @@ mkdir -p "$INSTALL_BASE"/{supervisor,launcher,stealth,scripts}
 [ -f launcher/bogger_efi_scan ] && \
     cp launcher/bogger_efi_scan "$INSTALL_BASE/launcher/" && \
     chmod +x "$INSTALL_BASE/launcher/bogger_efi_scan"
+
+# Kernel Module
+if [ -f kmod/bogger_kmod.ko ]; then
+    cp kmod/bogger_kmod.ko "$INSTALL_BASE/kmod/"
+    echo "[BOGGER] ✓ bogger_kmod.ko installed"
+else
+    echo "[BOGGER] WARNING: bogger_kmod.ko not found! Build kmod first."
+fi
 
 # Scripts
 cp launcher/bogger_launcher.sh "$INSTALL_BASE/launcher/"
