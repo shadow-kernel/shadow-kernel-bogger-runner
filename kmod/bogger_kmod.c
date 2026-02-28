@@ -27,6 +27,7 @@
 #include <linux/mm.h>
 #include <linux/sched.h>
 #include <linux/kthread.h>
+#include <linux/fs.h>
 #include <linux/kernel_read_file.h>
 #include <asm/processor.h>
 #include <asm/msr.h>
@@ -371,6 +372,19 @@ static u32 nvme_aqa;        /* Admin Queue Attributes */
 static u32 nvme_cc;         /* Controller Configuration */
 static u32 nvme_csts;       /* Controller Status */
 
+/* NVMe I/O queue state — support up to 4 I/O queue pairs (QID 1..4) */
+#define NVME_MAX_IO_QUEUES  4
+static u64 nvme_iosq_base[NVME_MAX_IO_QUEUES];  /* I/O SQ GPA per QID */
+static u16 nvme_iosq_size[NVME_MAX_IO_QUEUES];  /* I/O SQ entries per QID */
+static u64 nvme_iocq_base[NVME_MAX_IO_QUEUES];  /* I/O CQ GPA per QID */
+static u16 nvme_iocq_size[NVME_MAX_IO_QUEUES];  /* I/O CQ entries per QID */
+static u16 nvme_iosq_head[NVME_MAX_IO_QUEUES];  /* I/O SQ head (controller-side) */
+static u16 nvme_iocq_tail[NVME_MAX_IO_QUEUES];  /* I/O CQ tail (controller-side) */
+static u8  nvme_iocq_phase[NVME_MAX_IO_QUEUES]; /* I/O CQ phase tag */
+
+/* Host block device opened for NVMe I/O pass-through */
+static struct file *nvme_host_dev;
+
 /* Disk backing: pointer to guest RAM where the NVMe disk image lives */
 /* The actual disk data comes from the win11.qcow2 which QEMU provides
  * as a host-level NVMe device. We read it from the host and DMA it
@@ -481,8 +495,8 @@ static void nvme_process_admin_cmd(u32 *cmd)
     u8  opcode = cmd[0] & 0xFF;
     u16 cmd_id = (cmd[0] >> 16) & 0xFFFF;
     u32 nsid   = cmd[1];
-    u64 prp1   = (u64)cmd[6] | ((u64)cmd[7] << 32);
-    /* u64 prp2   = (u64)cmd[8] | ((u64)cmd[9] << 32); */
+    /* PRP1 is DW4/DW5; PRP2 is DW6/DW7 — note: old code had cmd[6] here (off-by-two bug) */
+    u64 prp1   = (u64)cmd[4] | ((u64)cmd[5] << 32);
     u32 cdw10  = cmd[10];
 
     switch (opcode) {
@@ -543,16 +557,33 @@ static void nvme_process_admin_cmd(u32 *cmd)
         }
         break;
     }
-    case 0x01: /* Create I/O Submission Queue */
-        pr_info("[BOGGER-NVMe] Create IO SQ: QID=%u size=%u\n",
-                cdw10 & 0xFFFF, (cdw10 >> 16) + 1);
+    case 0x01: { /* Create I/O Submission Queue */
+        u16 qid = cdw10 & 0xFFFF;
+        u16 qsz = (u16)((cdw10 >> 16) + 1);
+        if (qid >= 1 && qid <= NVME_MAX_IO_QUEUES) {
+            nvme_iosq_base[qid - 1] = prp1;  /* PRP1 = queue GPA (PC=1 mode) */
+            nvme_iosq_size[qid - 1] = qsz;
+            nvme_iosq_head[qid - 1] = 0;
+        }
+        pr_info("[BOGGER-NVMe] Create IO SQ: QID=%u size=%u base=0x%llx\n",
+                qid, qsz, prp1);
         nvme_post_completion(0, cmd_id, 0, 0);
         break;
-    case 0x05: /* Create I/O Completion Queue */
-        pr_info("[BOGGER-NVMe] Create IO CQ: QID=%u size=%u\n",
-                cdw10 & 0xFFFF, (cdw10 >> 16) + 1);
+    }
+    case 0x05: { /* Create I/O Completion Queue */
+        u16 qid = cdw10 & 0xFFFF;
+        u16 qsz = (u16)((cdw10 >> 16) + 1);
+        if (qid >= 1 && qid <= NVME_MAX_IO_QUEUES) {
+            nvme_iocq_base[qid - 1]  = prp1;  /* PRP1 = queue GPA (PC=1 mode) */
+            nvme_iocq_size[qid - 1]  = qsz;
+            nvme_iocq_tail[qid - 1]  = 0;
+            nvme_iocq_phase[qid - 1] = 1;
+        }
+        pr_info("[BOGGER-NVMe] Create IO CQ: QID=%u size=%u base=0x%llx\n",
+                qid, qsz, prp1);
         nvme_post_completion(0, cmd_id, 0, 0);
         break;
+    }
     case 0x09: /* Set Features */
         pr_info("[BOGGER-NVMe] Set Features: FID=%u\n", cdw10 & 0xFF);
         nvme_post_completion(0, cmd_id, 0, 0);
@@ -593,6 +624,174 @@ static void nvme_poll_doorbell(void)
 
     /* Update SQHD in MMIO regs so guest can read it */
     /* (The CQ entry already contains SQHD) */
+}
+
+/* ── NVMe I/O queue helpers ──────────────────────────────────────── */
+
+/* Post a completion entry to an I/O CQ in guest memory */
+static void nvme_post_io_completion(u16 qid, u16 sq_head, u16 cmd_id, u16 status)
+{
+    u16 qi = qid - 1;
+    u64 cq_entry_gpa;
+    u32 cqe[4];
+    u8  phase;
+
+    if (qid == 0 || qid > NVME_MAX_IO_QUEUES || !nvme_iocq_base[qi])
+        return;
+    if (!guest_ram_virt)
+        return;
+
+    phase = nvme_iocq_phase[qi];
+    cq_entry_gpa = nvme_iocq_base[qi] + (u64)nvme_iocq_tail[qi] * 16;
+    if (cq_entry_gpa + 16 > guest_ram_size)
+        return;
+
+    cqe[0] = 0;
+    cqe[1] = 0;
+    cqe[2] = (u32)qid | ((u32)sq_head << 16);
+    cqe[3] = (u32)cmd_id | ((u32)((status & 0x7FFE) | (phase ? 1 : 0)) << 16);
+    memcpy((u8 *)guest_ram_virt + cq_entry_gpa, cqe, 16);
+
+    nvme_iocq_tail[qi]++;
+    if (nvme_iocq_size[qi] && nvme_iocq_tail[qi] >= nvme_iocq_size[qi]) {
+        nvme_iocq_tail[qi] = 0;
+        nvme_iocq_phase[qi] ^= 1;
+    }
+}
+
+/* Copy data between host device and guest RAM using PRP list */
+static int nvme_prp_rw(u64 prp1, u64 prp2, u64 total_bytes,
+                       loff_t *pos, bool write)
+{
+    u64 bytes_done = 0;
+    u8 *tmp;
+    int rc = 0;
+
+    tmp = kmalloc(PAGE_SIZE, GFP_KERNEL | __GFP_NOWARN);
+    if (!tmp)
+        return -ENOMEM;
+
+    while (bytes_done < total_bytes) {
+        u64 cur_gpa;
+        u64 pg_off;
+        u64 chunk;
+        ssize_t r;
+
+        /* Determine the GPA for this chunk via the PRP chain */
+        if (bytes_done == 0) {
+            cur_gpa = prp1;
+        } else {
+            u64 first_page_bytes = PAGE_SIZE - (prp1 & 0xFFFULL);
+            u64 after_first = bytes_done - first_page_bytes;
+
+            if (bytes_done < first_page_bytes) {
+                /* Still in the first page */
+                cur_gpa = prp1 + bytes_done;
+            } else if (total_bytes - first_page_bytes <= PAGE_SIZE) {
+                /* Entire remainder fits in PRP2 directly */
+                cur_gpa = (prp2 & ~0xFFFULL) + after_first;
+            } else {
+                /* PRP2 is a PRP list: index 0 = second page, 1 = third, … */
+                u64 page_idx  = after_first / PAGE_SIZE;
+                u64 page_off2 = after_first % PAGE_SIZE;
+                u64 list_gpa  = (prp2 & ~0xFFFULL) + page_idx * 8;
+                u64 page_gpa;
+
+                if (list_gpa + 8 > guest_ram_size) { rc = -EIO; break; }
+                page_gpa = *(u64 *)((u8 *)guest_ram_virt + list_gpa);
+                cur_gpa  = (page_gpa & ~0xFFFULL) + page_off2;
+            }
+        }
+
+        pg_off = cur_gpa & 0xFFFULL;
+        chunk  = min_t(u64, total_bytes - bytes_done, PAGE_SIZE - pg_off);
+        if (cur_gpa + chunk > guest_ram_size) { rc = -EIO; break; }
+
+        if (write) {
+            memcpy(tmp, (u8 *)guest_ram_virt + cur_gpa, chunk);
+            r = kernel_write(nvme_host_dev, tmp, chunk, pos);
+        } else {
+            r = kernel_read(nvme_host_dev, tmp, chunk, pos);
+            if (r > 0)
+                memcpy((u8 *)guest_ram_virt + cur_gpa, tmp, r);
+        }
+
+        if (r <= 0) { rc = -EIO; break; }
+        bytes_done += (u64)r;
+    }
+
+    kfree(tmp);
+    return rc;
+}
+
+/* Process one NVMe I/O command (Read or Write) */
+static void nvme_process_io_cmd(u16 qid, u16 sq_head, u32 *cmd)
+{
+    u8  opcode     = cmd[0] & 0xFF;
+    u16 cmd_id     = (cmd[0] >> 16) & 0xFFFF;
+    u64 prp1       = (u64)cmd[4] | ((u64)cmd[5] << 32);
+    u64 prp2       = (u64)cmd[6] | ((u64)cmd[7] << 32);
+    u64 slba       = (u64)cmd[10] | ((u64)cmd[11] << 32);
+    u32 nlb        = (cmd[12] & 0xFFFF) + 1;  /* 0-based field → add 1 */
+    u64 total      = (u64)nlb * NVME_SECTOR_SIZE;
+    loff_t pos     = (loff_t)slba * NVME_SECTOR_SIZE;
+    u16 status     = 0;
+
+    switch (opcode) {
+    case 0x02: /* NVMe Read */
+        if (!nvme_host_dev || !guest_ram_virt) {
+            status = (0x0002 << 1);  /* Invalid Field */
+            break;
+        }
+        if (nvme_prp_rw(prp1, prp2, total, &pos, false) < 0)
+            status = (0x0004 << 1);  /* Data Transfer Error */
+        break;
+    case 0x01: /* NVMe Write */
+        if (!nvme_host_dev || !guest_ram_virt) {
+            status = (0x0002 << 1);
+            break;
+        }
+        if (nvme_prp_rw(prp1, prp2, total, &pos, true) < 0)
+            status = (0x0004 << 1);
+        break;
+    default:
+        status = (0x0001 << 1);  /* Invalid Opcode */
+        break;
+    }
+
+    nvme_post_io_completion(qid, sq_head, cmd_id, status);
+}
+
+/* Poll I/O queue doorbells and dispatch pending I/O commands */
+static void nvme_poll_io_doorbell(void)
+{
+    unsigned int qi;
+
+    if (!nvme_regs || !guest_ram_virt || !(nvme_csts & 1))
+        return;
+
+    for (qi = 0; qi < NVME_MAX_IO_QUEUES; qi++) {
+        u16 qid      = (u16)(qi + 1);
+        u16 new_tail;
+        u16 sq_size;
+        u64 sq_entry_gpa;
+
+        if (!nvme_iosq_base[qi] || !nvme_iosq_size[qi])
+            continue;
+
+        /* I/O SQ Tail doorbell: BAR + 0x1000 + (2 * qid) * 4 */
+        new_tail = (u16)(nvme_regs[0x400 + 2 * qid] & 0xFFFF);
+        sq_size  = nvme_iosq_size[qi];
+
+        while (nvme_iosq_head[qi] != new_tail) {
+            sq_entry_gpa = nvme_iosq_base[qi] + (u64)nvme_iosq_head[qi] * 64;
+            if (sq_entry_gpa + 64 <= guest_ram_size) {
+                u32 *cmd = (u32 *)((u8 *)guest_ram_virt + sq_entry_gpa);
+                nvme_process_io_cmd(qid, nvme_iosq_head[qi], cmd);
+            }
+            nvme_iosq_head[qi] = (nvme_iosq_head[qi] + 1) % sq_size;
+        }
+    }
 }
 
 /* ── NPT (Nested Page Tables) ────────────────────────────────────── */
@@ -1360,6 +1559,12 @@ static int bogger_vmcb_init(void)
     g_vmcb->control.intercepts[INTERCEPT_VMRUN / 32] |=
         (1U << (INTERCEPT_VMRUN % 32));
 
+    /* INTERCEPT_INTR: cause a VMEXIT on physical interrupts so the host
+     * scheduler can run (cond_resched) and timer-based OVMF delays make
+     * progress.  Without this the VMRUN loop never yields. */
+    g_vmcb->control.intercepts[INTERCEPT_INTR / 32] |=
+        (1U << (INTERCEPT_INTR % 32));
+
     g_vmcb->control.intercepts[INTERCEPT_HLT / 32]       |=
         (1U << (INTERCEPT_HLT % 32));
     g_vmcb->control.intercepts[INTERCEPT_IOIO_PROT / 32] |=
@@ -1758,6 +1963,9 @@ static void bogger_vmrun_loop(void)
 
         /* Process any pending NVMe admin commands (doorbell writes) */
         nvme_poll_doorbell();
+
+        /* Process any pending NVMe I/O commands (Read/Write) */
+        nvme_poll_io_doorbell();
 
         /* Reset clean bits before each VMRUN — tells CPU all fields
          * are potentially modified.  Required for KVM nested SVM. */
@@ -2392,6 +2600,11 @@ done:
         kthread_stop(hpet_kthread);
         hpet_kthread = NULL;
     }
+    /* Close host NVMe device — no longer needed once VMRUN loop ends */
+    if (nvme_host_dev) {
+        filp_close(nvme_host_dev, NULL);
+        nvme_host_dev = NULL;
+    }
     pr_emerg("[BOGGER] VMRUN loop ended after %d exits\n", exits);
     pr_emerg("[BOGGER] Final state: exit_code=0x%x RIP=0x%llx RSP=0x%llx\n",
             g_vmcb->control.exit_code, g_vmcb->save.rip, g_vmcb->save.rsp);
@@ -2471,7 +2684,23 @@ static int __init bogger_kmod_init(void)
     ret = bogger_vmcb_init();
     if (ret) goto err_free_hsave;
 
-    /* 9. Enter VMRUN loop — OVMF starts at reset vector → boots Windows */
+    /* 9. Open host NVMe block device for I/O pass-through to guest.
+     * The host exposes the Windows disk as /dev/nvme0n1 (QEMU NVMe). */
+    nvme_host_dev = filp_open("/dev/nvme0n1", O_RDWR | O_LARGEFILE, 0);
+    if (IS_ERR(nvme_host_dev)) {
+        pr_warn("[BOGGER] Failed to open host NVMe /dev/nvme0n1: %ld — read-only retry\n",
+                PTR_ERR(nvme_host_dev));
+        nvme_host_dev = filp_open("/dev/nvme0n1", O_RDONLY | O_LARGEFILE, 0);
+        if (IS_ERR(nvme_host_dev)) {
+            pr_warn("[BOGGER] /dev/nvme0n1 not available: %ld — NVMe I/O disabled\n",
+                    PTR_ERR(nvme_host_dev));
+            nvme_host_dev = NULL;
+        }
+    }
+    if (nvme_host_dev)
+        pr_info("[BOGGER] Host NVMe device opened for guest I/O pass-through\n");
+
+    /* 10. Enter VMRUN loop — OVMF starts at reset vector → boots Windows */
     pr_info("[BOGGER] ═══ Launching OVMF via VMRUN ═══\n");
     bogger_vmrun_loop();
 
@@ -2499,6 +2728,11 @@ err_free_ram:
 static void __exit bogger_kmod_exit(void)
 {
     pr_info("[BOGGER] Kernel module unloading\n");
+
+    if (nvme_host_dev) {
+        filp_close(nvme_host_dev, NULL);
+        nvme_host_dev = NULL;
+    }
 
     if (g_vmcb) {
         free_page((unsigned long)g_vmcb);
